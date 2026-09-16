@@ -5,7 +5,17 @@ from fastapi.testclient import TestClient
 
 from src.api import app
 
-client = TestClient(app)
+
+@pytest.fixture(scope="module")
+def client():
+    # Models load inside api.py's `lifespan`, not at module level (see that
+    # file's comment on why) -- a bare `TestClient(app)` does NOT trigger
+    # lifespan startup/shutdown, only `with TestClient(app) as c:` does.
+    # Module-scoped so the ~3s local model load happens once for this file,
+    # not once per test.
+    with TestClient(app) as c:
+        yield c
+
 
 FIXTURES = Path(__file__).parent / "fixtures"
 #: A real single-face photo, gitignored -- same reasoning as celeb-lookalike's
@@ -15,20 +25,20 @@ FIXTURES = Path(__file__).parent / "fixtures"
 SINGLE_FACE = FIXTURES / "single-face.jpg"
 
 
-def test_health():
+def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json() == {"ok": True}
 
 
-def test_unreadable_image_rejected():
+def test_unreadable_image_rejected(client):
     r = client.post("/face-cutout", files={"file": ("bad.jpg", b"not an image", "image/jpeg")})
     assert r.status_code == 400
     assert r.json()["detail"]["error"] == "unreadable_image"
 
 
-def test_no_face_detected(monkeypatch):
-    monkeypatch.setattr("src.api._face_counter.detect_boxes", lambda bgr: [])
+def test_no_face_detected(client, monkeypatch):
+    monkeypatch.setattr(app.state.face_counter, "detect_boxes", lambda bgr: [])
     r = client.post(
         "/face-cutout",
         files={"file": ("photo.jpg", _tiny_valid_jpeg(), "image/jpeg")},
@@ -37,9 +47,10 @@ def test_no_face_detected(monkeypatch):
     assert r.json()["detail"]["error"] == "no_face"
 
 
-def test_multiple_faces_detected(monkeypatch):
+def test_multiple_faces_detected(client, monkeypatch):
     monkeypatch.setattr(
-        "src.api._face_counter.detect_boxes",
+        app.state.face_counter,
+        "detect_boxes",
         lambda bgr: [(0, 0, 10, 10), (20, 20, 30, 30)],
     )
     r = client.post(
@@ -52,7 +63,7 @@ def test_multiple_faces_detected(monkeypatch):
     assert body["count"] == 2
 
 
-def test_file_too_large(monkeypatch):
+def test_file_too_large(client, monkeypatch):
     monkeypatch.setattr("src.config.settings.max_upload_bytes", 10)
     r = client.post(
         "/face-cutout",
@@ -62,7 +73,7 @@ def test_file_too_large(monkeypatch):
 
 
 @pytest.mark.skipif(not SINGLE_FACE.exists(), reason="no single-face fixture present")
-def test_happy_path_real_photo():
+def test_happy_path_real_photo(client):
     r = client.post(
         "/face-cutout",
         files={"file": ("photo.jpg", SINGLE_FACE.read_bytes(), "image/jpeg")},
