@@ -1,0 +1,29 @@
+[project]
+name = "facy-bird-api"
+version = "0.1.0"
+description = "Turns a user's profile photo into a background-removed, face-centred bird sprite for flappy-bird-web's Facy Bird mode. Stateless, no database."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10,<5",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.2",
+    "requests>=2.31",
+    "pillow>=10.0",
+    "rembg[cpu]>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx>=0.27"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

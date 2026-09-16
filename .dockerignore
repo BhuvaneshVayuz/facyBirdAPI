@@ -1,0 +1,18 @@
+# Keep the build context small and keep secrets out of the image.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+
+# Settings come from Render's environment, never from a baked-in file.
+.env
+
+# Downloaded at build time by the Dockerfile itself (ensure_yunet /
+# new_session), not copied in from the host -- a stale local copy here
+# should never shadow that.
+models/
+
+# Real photos of real people do not belong in an image, and this service
+# has no need for the test suite at runtime anyway.
+tests/

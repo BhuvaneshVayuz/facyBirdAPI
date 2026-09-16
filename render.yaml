@@ -1,0 +1,18 @@
+# Render blueprint. Dashboard -> New -> Blueprint -> point at this repo.
+# No database, unlike leaderboard-api -- this service is stateless, same
+# posture as fame-battle-api: process a request, return a result, keep
+# nothing.
+services:
+  - type: web
+    name: facy-bird-api
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"
+      - key: MAX_UPLOAD_BYTES
+        value: "8388608"
+      - key: OUTPUT_SIZE
+        value: "512"
