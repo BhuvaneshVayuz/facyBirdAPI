@@ -1,8 +1,9 @@
 """facy-bird-api: turns a user's profile photo into a bird sprite.
 
 Stateless, like fame-battle-api -- no database, nothing persisted. One
-endpoint: upload a photo, get back a background-removed, face-centred PNG
-cutout, or a typed error if the photo has zero or multiple faces in it.
+endpoint: give it a photo URL, get back a background-removed, face-centred
+PNG cutout, or a typed error if the photo has zero or multiple faces in it
+(or couldn't be fetched at all).
 """
 
 from __future__ import annotations
@@ -12,13 +13,15 @@ from contextlib import asynccontextmanager
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from pydantic import BaseModel
 
 from .config import settings
 from .cutout import CutoutMaker
 from .face_detect import FaceCounter
+from .photo_fetch import PhotoFetchError, fetch_photo_bytes
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -57,11 +60,22 @@ def health():
     return {"ok": True}
 
 
+class FaceCutoutRequest(BaseModel):
+    photo_url: str
+
+
+# Plain `def`, not `async def` -- everything in here (the download, cv2
+# decode, YuNet, rembg) is blocking, synchronous work. FastAPI runs a sync
+# endpoint in its own threadpool automatically; an async one would run
+# straight on the event loop and stall every other in-flight request for as
+# long as the download takes, up to fetch_timeout_seconds.
 @app.post("/face-cutout")
-async def face_cutout(file: UploadFile):
-    raw = await file.read()
-    if len(raw) > settings.max_upload_bytes:
-        raise HTTPException(413, detail={"error": "file_too_large"})
+def face_cutout(payload: FaceCutoutRequest):
+    try:
+        raw = fetch_photo_bytes(payload.photo_url)
+    except PhotoFetchError as err:
+        status = 413 if err.code == "file_too_large" else 400
+        raise HTTPException(status, detail={"error": err.code}) from err
 
     arr = np.frombuffer(raw, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)

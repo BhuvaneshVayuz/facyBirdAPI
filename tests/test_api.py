@@ -4,6 +4,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api import app
+from src.photo_fetch import PhotoFetchError
+
+FIXTURES = Path(__file__).parent / "fixtures"
+#: A real single-face photo, gitignored -- same reasoning as celeb-lookalike's
+#: image corpus: real photos of real people do not belong in version control.
+#: Drop one at tests/fixtures/single-face.jpg to run the true integration
+#: test; it skips (not fails) when absent, e.g. in CI.
+SINGLE_FACE = FIXTURES / "single-face.jpg"
 
 
 @pytest.fixture(scope="module")
@@ -17,67 +25,68 @@ def client():
         yield c
 
 
-FIXTURES = Path(__file__).parent / "fixtures"
-#: A real single-face photo, gitignored -- same reasoning as celeb-lookalike's
-#: image corpus: real photos of real people do not belong in version control.
-#: Drop one at tests/fixtures/single-face.jpg to run the true integration
-#: test; it skips (not fails) when absent, e.g. in CI.
-SINGLE_FACE = FIXTURES / "single-face.jpg"
-
-
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json() == {"ok": True}
 
 
-def test_unreadable_image_rejected(client):
-    r = client.post("/face-cutout", files={"file": ("bad.jpg", b"not an image", "image/jpeg")})
+def test_unreadable_image_rejected(client, monkeypatch):
+    monkeypatch.setattr("src.api.fetch_photo_bytes", lambda url: b"not an image")
+    r = client.post("/face-cutout", json={"photo_url": "https://example.com/photo.jpg"})
     assert r.status_code == 400
     assert r.json()["detail"]["error"] == "unreadable_image"
 
 
 def test_no_face_detected(client, monkeypatch):
+    monkeypatch.setattr("src.api.fetch_photo_bytes", lambda url: _tiny_valid_jpeg())
     monkeypatch.setattr(app.state.face_counter, "detect_boxes", lambda bgr: [])
-    r = client.post(
-        "/face-cutout",
-        files={"file": ("photo.jpg", _tiny_valid_jpeg(), "image/jpeg")},
-    )
+    r = client.post("/face-cutout", json={"photo_url": "https://example.com/photo.jpg"})
     assert r.status_code == 422
     assert r.json()["detail"]["error"] == "no_face"
 
 
 def test_multiple_faces_detected(client, monkeypatch):
+    monkeypatch.setattr("src.api.fetch_photo_bytes", lambda url: _tiny_valid_jpeg())
     monkeypatch.setattr(
         app.state.face_counter,
         "detect_boxes",
         lambda bgr: [(0, 0, 10, 10), (20, 20, 30, 30)],
     )
-    r = client.post(
-        "/face-cutout",
-        files={"file": ("photo.jpg", _tiny_valid_jpeg(), "image/jpeg")},
-    )
+    r = client.post("/face-cutout", json={"photo_url": "https://example.com/photo.jpg"})
     assert r.status_code == 422
     body = r.json()["detail"]
     assert body["error"] == "multiple_faces"
     assert body["count"] == 2
 
 
-def test_file_too_large(client, monkeypatch):
-    monkeypatch.setattr("src.config.settings.max_upload_bytes", 10)
-    r = client.post(
-        "/face-cutout",
-        files={"file": ("photo.jpg", _tiny_valid_jpeg(), "image/jpeg")},
-    )
-    assert r.status_code == 413
+@pytest.mark.parametrize(
+    ("code", "expected_status"),
+    [
+        ("invalid_url", 400),
+        ("photo_unavailable", 400),
+        ("file_too_large", 413),
+    ],
+)
+def test_photo_fetch_errors_map_to_correct_status(client, monkeypatch, code, expected_status):
+    def raise_it(url):
+        raise PhotoFetchError(code)
+
+    monkeypatch.setattr("src.api.fetch_photo_bytes", raise_it)
+    r = client.post("/face-cutout", json={"photo_url": "https://example.com/photo.jpg"})
+    assert r.status_code == expected_status
+    assert r.json()["detail"]["error"] == code
 
 
 @pytest.mark.skipif(not SINGLE_FACE.exists(), reason="no single-face fixture present")
-def test_happy_path_real_photo(client):
-    r = client.post(
-        "/face-cutout",
-        files={"file": ("photo.jpg", SINGLE_FACE.read_bytes(), "image/jpeg")},
-    )
+def test_happy_path_real_photo(client, monkeypatch):
+    # Mocks only the download step -- everything downstream (decode, YuNet,
+    # rembg) runs for real against the real fixture bytes, same as before
+    # this endpoint took a URL instead of an upload.
+    photo_bytes = SINGLE_FACE.read_bytes()
+    monkeypatch.setattr("src.api.fetch_photo_bytes", lambda url: photo_bytes)
+
+    r = client.post("/face-cutout", json={"photo_url": "https://example.com/photo.jpg"})
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
     assert len(r.content) > 1000  # not an empty/broken PNG

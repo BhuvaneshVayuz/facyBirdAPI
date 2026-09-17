@@ -8,7 +8,6 @@ dependencies = [
     "opencv-python-headless>=4.10,<5",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
-    "python-multipart>=0.0.9",
     "pydantic-settings>=2.2",
     "requests>=2.31",
     "pillow>=10.0",

@@ -82,5 +82,8 @@ uvicorn src.api:app --reload
 ```bash
 docker build -t facy-bird-api .
 docker run --rm -p 8000:8000 facy-bird-api
-curl -F "file=@/path/to/a/real/photo.jpg" localhost:8000/face-cutout -o cutout.png
+curl -X POST localhost:8000/face-cutout \
+  -H "Content-Type: application/json" \
+  -d '{"photo_url": "https://example.com/a-real-single-face-photo.jpg"}' \
+  -o cutout.png
 ```
