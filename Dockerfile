@@ -14,7 +14,20 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Every one of these libraries auto-detects thread count from the
+    # container's *visible* CPU count (12 in testing on Render Free), not
+    # its actual cgroup quota (0.1 of one core) -- left unset, that's a
+    # dozen threads thrashing over a tenth of a core, measured at a 33.8s
+    # single request that takes ~0.5s unconstrained. onnxruntime is also
+    # pinned explicitly in cutout.py's SessionOptions; these cover the rest
+    # of the stack (OpenCV, numpy/scipy's BLAS backend, numba, if any of
+    # rembg's dependencies reach for it).
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMBA_NUM_THREADS=1 \
+    OPENCV_NUM_THREADS=1
 
 WORKDIR /app
 

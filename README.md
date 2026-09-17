@@ -59,9 +59,10 @@ JSON body: `{"photo_url": "https://..."}`. Response is `image/png`
    fallback for group photos, same principle as celeb-lookalike's
    `face_validation.py`.
 3. **rembg** (`u2netp` weights, Apache 2.0) removes the background from the
-   full frame -- run on the whole photo rather than a pre-crop, since the
-   segmenter does better with torso/shoulder context than a tight face-only
-   patch.
+   full frame, downscaled first to at most 800px on the long edge
+   (`_MAX_SEGMENT_EDGE` in `cutout.py`) -- run on the whole photo rather than
+   a pre-crop, since the segmenter does better with torso/shoulder context
+   than a tight face-only patch.
 4. The result is cropped to a square centred on the detected face (2.4x the
    face box, so the sprite reads as "a head" with some hair/chin/shoulder
    room, not a tight eyes-nose-mouth rectangle) and resized to
@@ -72,6 +73,48 @@ step above is blocking, synchronous work (the download included), and
 FastAPI runs a sync endpoint in its own threadpool automatically. An async
 def here would run straight on the event loop and stall every other
 in-flight request for as long as the slowest step takes.
+
+## Render Free tier: what actually broke and what fixed it
+
+Three separate problems showed up in production, each looking like a
+different failure until measured directly (reproduced locally with
+`docker run --cpus=0.1 --memory=512m`, matching Render Free's actual
+allocation):
+
+1. **Deploys intermittently failed** ("Port scan timeout reached"). Cause:
+   both models loaded as module-level code, which blocks uvicorn from
+   binding its port at all until loading finishes -- fixed by moving loading
+   into `lifespan` (`api.py`), so the port opens in ~1-2s regardless of how
+   long model loading takes afterward.
+2. **A single `/face-cutout` call could take 60+ seconds and never return**,
+   eventually taking the whole service down (health checks started failing
+   too). Cause: onnxruntime's default thread count is "auto", which reads
+   `os.cpu_count()` -- inside this container that's the *host's* full core
+   count (12, in testing), not the actual cgroup quota (0.1 of one core). A
+   dozen threads fighting over a tenth of a core's worth of real CPU time is
+   catastrophic scheduling thrash, not a hang: one call measured at 33.8s for
+   work that takes ~0.5s unconstrained. Fixed by pinning
+   `intra_op_num_threads`/`inter_op_num_threads` to 1 on rembg's session
+   (`cutout.py`) and setting `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/
+   `MKL_NUM_THREADS`/`NUMBA_NUM_THREADS`/`OPENCV_NUM_THREADS=1` in the
+   Dockerfile for the rest of the stack.
+3. **Memory climbed toward the 512MB limit within 2-3 requests on the same
+   worker and stayed there**, one bad request away from an OOM kill. Cause:
+   onnxruntime's memory arena allocator grows to serve peak demand and does
+   not hand pages back to the OS between calls -- this is *not* primarily an
+   input-image-size problem (a small 396px test photo alone already peaked
+   at 437MB on a fresh instance); it is a long-lived-process accumulation
+   problem. Fixed by disabling the arena
+   (`enable_cpu_mem_arena = enable_mem_pattern = False` in `cutout.py`'s
+   `SessionOptions`) -- trades a little per-call speed for actually
+   releasing memory after each request. Measured holding steady in the
+   220-360MB range across 10 consecutive real requests afterward, instead of
+   climbing to the ceiling by request 3.
+
+The input downscale in step 3 above (`_MAX_SEGMENT_EDGE`) is a related but
+separate mitigation -- it caps the *peak* memory a single very large photo
+(an uncompressed phone photo can be 3000-4000px) could otherwise demand,
+independent of the cross-request accumulation problem above.
 
 See [LICENSES.md](LICENSES.md) for where both models come from.
 
