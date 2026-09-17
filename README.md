@@ -58,8 +58,9 @@ JSON body: `{"photo_url": "https://..."}`. Response is `image/png`
    many. `0 -> no_face`, `2+ -> multiple_faces`, no "guess the subject"
    fallback for group photos, same principle as celeb-lookalike's
    `face_validation.py`.
-3. **rembg** (`u2netp` weights, Apache 2.0) removes the background from the
-   full frame, downscaled first to at most 800px on the long edge
+3. **u2netp** (Apache 2.0, run directly through OpenCV's DNN backend --
+   `cv2.dnn`, not the `rembg` package) removes the background from the full
+   frame, downscaled first to at most 800px on the long edge
    (`_MAX_SEGMENT_EDGE` in `cutout.py`) -- run on the whole photo rather than
    a pre-crop, since the segmenter does better with torso/shoulder context
    than a tight face-only patch.
@@ -76,7 +77,7 @@ in-flight request for as long as the slowest step takes.
 
 ## Render Free tier: what actually broke and what fixed it
 
-Three separate problems showed up in production, each looking like a
+Four separate problems showed up in production, each looking like a
 different failure until measured directly (reproduced locally with
 `docker run --cpus=0.1 --memory=512m`, matching Render Free's actual
 allocation):
@@ -88,35 +89,50 @@ allocation):
    long model loading takes afterward.
 2. **A single `/face-cutout` call could take 60+ seconds and never return**,
    eventually taking the whole service down (health checks started failing
-   too). Cause: onnxruntime's default thread count is "auto", which reads
+   too). Cause (back when this ran through onnxruntime, before problem #4's
+   fix below): onnxruntime's default thread count is "auto", which reads
    `os.cpu_count()` -- inside this container that's the *host's* full core
    count (12, in testing), not the actual cgroup quota (0.1 of one core). A
    dozen threads fighting over a tenth of a core's worth of real CPU time is
    catastrophic scheduling thrash, not a hang: one call measured at 33.8s for
-   work that takes ~0.5s unconstrained. Fixed by pinning
-   `intra_op_num_threads`/`inter_op_num_threads` to 1 on rembg's session
-   (`cutout.py`) and setting `OMP_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/
-   `MKL_NUM_THREADS`/`NUMBA_NUM_THREADS`/`OPENCV_NUM_THREADS=1` in the
-   Dockerfile for the rest of the stack.
+   work that takes ~0.5s unconstrained.
 3. **Memory climbed toward the 512MB limit within 2-3 requests on the same
-   worker and stayed there**, one bad request away from an OOM kill. Cause:
-   onnxruntime's memory arena allocator grows to serve peak demand and does
-   not hand pages back to the OS between calls -- this is *not* primarily an
-   input-image-size problem (a small 396px test photo alone already peaked
-   at 437MB on a fresh instance); it is a long-lived-process accumulation
-   problem. Fixed by disabling the arena
-   (`enable_cpu_mem_arena = enable_mem_pattern = False` in `cutout.py`'s
-   `SessionOptions`) -- trades a little per-call speed for actually
-   releasing memory after each request. Measured holding steady in the
-   220-360MB range across 10 consecutive real requests afterward, instead of
-   climbing to the ceiling by request 3.
+   worker and stayed there**, one bad request away from an OOM kill. Cause
+   (also onnxruntime, also since removed): its memory arena allocator grows
+   to serve peak demand and does not hand pages back to the OS between
+   calls -- a long-lived-process accumulation problem, not primarily an
+   input-image-size one (a small 396px test photo alone already peaked at
+   437MB on a fresh instance).
+4. **Deploys and cold starts intermittently failed even when the app itself
+   was fine** -- Render's platform-level 5-minute port-scan timeout was
+   consistently shorter than the ~6 minutes it took to *pull* this image
+   (~900MB at the time) onto a fresh instance, before the app had even
+   started. This is what problems #2 and #3 turned out to trace back to:
+   both were onnxruntime's auto-threading and memory-arena behaviour, pulled
+   in as a transitive dependency of `rembg` -- and `rembg`'s own top-level
+   module eagerly imports `pymatting`/`scipy`/`scikit-image` regardless of
+   whether their only consumer (an optional refinement mode never enabled
+   here) is ever used, so that whole chain
+   (`onnxruntime`+`pymatting`+`scipy`+`scikit-image`+`numba`+`llvmlite`+
+   `networkx`) could not just be uninstalled after the fact without breaking
+   `import rembg` outright. **Fixed by dropping `rembg` and `onnxruntime`
+   entirely** and running the same `u2netp` weights directly through
+   `cv2.dnn` (`cutout.py`) -- OpenCV is already a hard dependency for YuNet,
+   so this adds zero new dependencies. Image dropped from ~900MB to
+   **~451MB**; problems #2 and #3 disappeared as a side effect, since
+   OpenCV's DNN backend doesn't have onnxruntime's auto-threading or
+   arena-growth behaviour to begin with. Measured after the rewrite: fresh
+   container healthy in ~7s (was up to 60s), memory settling at a flat
+   ~309MB and staying there across 10 consecutive real requests (was
+   climbing to the 512MB ceiling by request 3).
 
-The input downscale in step 3 above (`_MAX_SEGMENT_EDGE`) is a related but
-separate mitigation -- it caps the *peak* memory a single very large photo
-(an uncompressed phone photo can be 3000-4000px) could otherwise demand,
-independent of the cross-request accumulation problem above.
+The input downscale (`_MAX_SEGMENT_EDGE` in `cutout.py`) is a related but
+separate, still-relevant mitigation -- it caps the memory a single very
+large photo (an uncompressed phone photo can be 3000-4000px) demands at the
+preprocessing step, independent of everything above.
 
-See [LICENSES.md](LICENSES.md) for where both models come from.
+See [LICENSES.md](LICENSES.md) for where both models come from and why
+`cv2.dnn` replaced `rembg`.
 
 ## Running locally
 
@@ -127,8 +143,8 @@ pip install -e ".[dev]"
 uvicorn src.api:app --reload
 ```
 
-First run downloads both model weights (~5MB combined) to `models/` and
-`~/.rembg/`; subsequent runs load from that cache.
+First run downloads both model weights (~5MB combined) to `models/`;
+subsequent runs load from that cache.
 
 ## Testing
 
@@ -151,6 +167,6 @@ docker run --rm -p 8000:8000 facy-bird-api
 curl localhost:8000/health
 ```
 
-Image is ~900MB -- opencv, onnxruntime, and rembg's matting dependencies
-(scipy/scikit-image/numba, pulled in transitively) account for most of it.
-Normal for an ML-serving container; nowhere near Render's free-tier limits.
+Image is ~451MB -- opencv (which drives both models, see "Render Free tier"
+above for why rembg/onnxruntime aren't dependencies here) and the Python
+3.11 base account for most of it.

@@ -5,7 +5,7 @@ service.
 
 | | where | what |
 |---|---|---|
-| API | Render (Docker web service) | FastAPI, ~900MB image (opencv + onnxruntime + rembg's matting deps) |
+| API | Render (Docker web service) | FastAPI, ~451MB image (opencv drives both models directly via cv2.dnn -- see README's "Render Free tier" section for why onnxruntime/rembg aren't dependencies) |
 
 ---
 
@@ -29,10 +29,9 @@ Dashboard -> **New** -> **Blueprint** -> select the repo -> reads
 [render.yaml](render.yaml). No extra environment variables to set by hand
 (unlike leaderboard-api, there's no `DATABASE_URL` to attach).
 
-The image is large enough that the *first* build will take a while (Docker
-layer with onnxruntime + scipy + scikit-image + rembg's dependency tree, plus
-downloading and baking in both model weights). Subsequent deploys from an
-unchanged `pyproject.toml` reuse that cached layer and are fast.
+The *first* build takes a little while (installing opencv, then downloading
+and baking in both model weights). Subsequent deploys from an unchanged
+`pyproject.toml` reuse that cached layer and are fast.
 
 Then check it:
 
