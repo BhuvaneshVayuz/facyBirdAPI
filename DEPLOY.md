@@ -1,7 +1,9 @@
 # Deploying
 
-Same Render pattern as fame-battle-api: no database, just a Docker web
-service.
+Same Render pattern as the other services: a Docker web service, plus an
+*optional* Postgres connection for the cutout cache (the same Neon database
+leaderboard-api uses). Skip the database entirely and the service still
+works -- it just recomputes every cutout.
 
 | | where | what |
 |---|---|---|
@@ -26,8 +28,18 @@ repo in this project.
 ## 2. API on Render
 
 Dashboard -> **New** -> **Blueprint** -> select the repo -> reads
-[render.yaml](render.yaml). No extra environment variables to set by hand
-(unlike leaderboard-api, there's no `DATABASE_URL` to attach).
+[render.yaml](render.yaml).
+
+One optional variable to set by hand afterwards, the same way
+leaderboard-api's is set (Neon connection strings can't be auto-injected by
+a Render blueprint): **Environment** -> add `DATABASE_URL` = the *same* Neon
+connection string leaderboard-api uses. This service creates its own
+`face_cutouts` table there and touches nothing else -- no foreign key to
+`users`, so the two services stay independent and deploy order doesn't
+matter.
+
+Leaving it unset is a supported configuration, not a broken one: the cutout
+cache logs that it's disabled and every request recomputes.
 
 The *first* build takes a little while (installing opencv, then downloading
 and baking in both model weights). Subsequent deploys from an unchanged

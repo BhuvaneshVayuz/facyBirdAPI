@@ -1,7 +1,7 @@
 [project]
 name = "facy-bird-api"
 version = "0.1.0"
-description = "Turns a user's profile photo into a background-removed, face-centred bird sprite for flappy-bird-web's Facy Bird mode. Stateless, no database."
+description = "Turns a user's profile photo into a background-removed, face-centred bird sprite for flappy-bird-web's Facy Bird mode. Caches results in Postgres against the photo URL so the same photo is only ever processed once."
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "requests>=2.31",
     "pillow>=10.0",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.optional-dependencies]

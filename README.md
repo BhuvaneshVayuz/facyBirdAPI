@@ -2,8 +2,15 @@
 
 Turns a user's profile photo into a bird sprite for flappy-bird-web's "Facy
 Bird" mode: background removed, cropped square around the face. One
-endpoint, no database, nothing persisted -- same stateless posture as
-fame-battle-api, not leaderboard-api's.
+endpoint, and results are memoised in Postgres against the photo URL so the
+same photo is never downloaded and segmented twice.
+
+That cache is strictly an optimisation and the service is designed to work
+without it: with no `DATABASE_URL` set -- or with the database unreachable,
+at startup or mid-flight -- it falls back to computing every request from
+scratch, exactly the stateless posture it shipped with. See
+[src/cutout_cache.py](src/cutout_cache.py) for why the photo URL is the key
+and why that makes invalidation free.
 
 ## Why this exists as a backend, not client-side
 
@@ -50,6 +57,9 @@ JSON body: `{"photo_url": "https://..."}`. Response is `image/png`
 
 ## How a request is processed
 
+0. **Cache lookup** (`src/cutout_cache.py`), before anything else happens --
+   a hit returns immediately, skipping both the download and both models.
+   See "The cutout cache" below.
 1. **Download** the photo from `photo_url` server-side (`src/photo_fetch.py`),
    enforcing the SSRF guards above, a `FETCH_TIMEOUT_SECONDS` timeout, and
    `MAX_UPLOAD_BYTES` as a streaming size cap.
@@ -74,6 +84,51 @@ step above is blocking, synchronous work (the download included), and
 FastAPI runs a sync endpoint in its own threadpool automatically. An async
 def here would run straight on the event loop and stall every other
 in-flight request for as long as the slowest step takes.
+
+## The cutout cache
+
+Steps 1-4 above are a pure function of the photo bytes, so running them twice
+for the same photo is wasted work -- and the expensive half isn't the
+inference, it's the outbound download, which is unbounded up to
+`FETCH_TIMEOUT_SECONDS`. Results are therefore memoised in Postgres and the
+lookup happens *before* the download.
+
+**The key is the photo URL** (hashed together with `OUTPUT_SIZE`, so
+retuning that setting can't serve entries rendered at the old size). That
+works because the host app mints a new S3 key on every profile-photo upload:
+a changed photo is a changed URL, which misses and recomputes. Invalidation
+is free and there is nothing to expire for correctness.
+
+Keyed on the URL rather than a user id deliberately. For "is this the same
+image" the URL already *is* the image's identity; a user id would add
+nothing to the lookup while requiring the frontend to send a field it
+currently doesn't -- and `user_id` here comes from the host's localStorage,
+so it's caller-controlled and not something to key a shared cache on. **The
+frontend contract is unchanged**, so already-deployed MF bundles get this
+without being rebuilt.
+
+`no_face` and `multiple_faces` are cached too: both are verdicts about a
+photo that decoded fine, so they're deterministic for those bytes, and
+without this a faceless profile photo re-downloads and re-runs YuNet on
+every single click forever. Transient failures (`photo_unavailable`,
+`invalid_url`) and `unreadable_image` are deliberately *not* cached -- a
+truncated download produces the latter too, and neither says anything about
+the real photo, so both stay retryable.
+
+**It is strictly an optimisation.** With no `DATABASE_URL` set the cache
+disables itself; if the database is unreachable at startup it logs and
+carries on (an exception escaping `lifespan` would abort startup and take
+the endpoint down entirely -- far worse than not caching); if it fails
+mid-flight, reads degrade to a miss and writes are dropped. In every one of
+those cases `/face-cutout` behaves exactly as it did when this service was
+stateless.
+
+Rows nothing has requested in `CACHE_TTL_DAYS` (default 90) are swept at
+startup. This matters because a new photo means a new URL means a new row,
+so every profile-photo change a user ever makes orphans the previous one --
+at a few hundred KB per PNG that reaches Neon's free-tier storage limit
+sooner than you would guess. A cache hit touches `last_used_at`, so entries
+still in use are never swept.
 
 ## Render Free tier: what actually broke and what fixed it
 

@@ -1,7 +1,12 @@
 # Render blueprint. Dashboard -> New -> Blueprint -> point at this repo.
-# No database, unlike leaderboard-api -- this service is stateless, same
-# posture as fame-battle-api: process a request, return a result, keep
-# nothing.
+#
+# DATABASE_URL is NOT set here, for the same reason it isn't in
+# leaderboard-api's blueprint: Postgres lives on Neon, not Render, so the
+# connection string gets pasted in by hand under this service's Environment
+# tab. Point it at the *same* Neon database leaderboard-api uses -- this
+# service creates its own `face_cutouts` table there and touches nothing
+# else. Leaving it unset is a supported configuration, not a broken one:
+# the cutout cache disables itself and every request recomputes.
 services:
   - type: web
     name: facy-bird-api

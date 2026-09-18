@@ -1,9 +1,14 @@
 """facy-bird-api: turns a user's profile photo into a bird sprite.
 
-Stateless, like fame-battle-api -- no database, nothing persisted. One
-endpoint: give it a photo URL, get back a background-removed, face-centred
-PNG cutout, or a typed error if the photo has zero or multiple faces in it
-(or couldn't be fetched at all).
+One endpoint: give it a photo URL, get back a background-removed,
+face-centred PNG cutout, or a typed error if the photo has zero or multiple
+faces in it (or couldn't be fetched at all).
+
+Results are memoised in Postgres against the photo URL (see cutout_cache.py)
+so the same photo is never downloaded and segmented twice. That cache is
+strictly an optimisation: with no DATABASE_URL configured, or with the
+database unreachable, this service still answers every request by computing
+the cutout from scratch, exactly as it did when it was stateless.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from pydantic import BaseModel
 
 from .config import settings
 from .cutout import CutoutMaker
+from .cutout_cache import CutoutCache, make_cache_key
 from .face_detect import FaceCounter
 from .photo_fetch import PhotoFetchError, fetch_photo_bytes
 
@@ -43,6 +49,11 @@ async def lifespan(app: FastAPI):
     # before they exist -- no readiness flag needed on top of that.
     app.state.face_counter = FaceCounter()
     app.state.cutout_maker = CutoutMaker()
+    # Constructed last and never allowed to raise (see CutoutCache) -- the
+    # two models above are what this service genuinely cannot serve without,
+    # and a cache that can't reach its database must not join them in being
+    # able to abort startup.
+    app.state.cutout_cache = CutoutCache()
     yield
 
 
@@ -69,8 +80,31 @@ class FaceCutoutRequest(BaseModel):
 # endpoint in its own threadpool automatically; an async one would run
 # straight on the event loop and stall every other in-flight request for as
 # long as the download takes, up to fetch_timeout_seconds.
+def _face_verdict_error(code: str, face_count: int | None) -> HTTPException:
+    """The 422 for a photo that decoded fine but isn't usable as a sprite.
+
+    Built in one place so a replayed cache hit is indistinguishable from a
+    freshly computed verdict -- same status, same detail shape, `count`
+    included for multiple_faces exactly as before.
+    """
+    detail: dict = {"error": code}
+    if face_count is not None:
+        detail["count"] = face_count
+    return HTTPException(422, detail=detail)
+
+
 @app.post("/face-cutout")
 def face_cutout(payload: FaceCutoutRequest):
+    # Checked before the download, not just before inference: on a hit this
+    # skips the outbound fetch too, which is the larger and far more
+    # variable half of the work.
+    cache_key = make_cache_key(payload.photo_url, settings.output_size)
+    cached = app.state.cutout_cache.get(cache_key)
+    if cached is not None:
+        if cached.error_code is not None:
+            raise _face_verdict_error(cached.error_code, cached.face_count)
+        return Response(content=cached.png, media_type="image/png")
+
     try:
         raw = fetch_photo_bytes(payload.photo_url)
     except PhotoFetchError as err:
@@ -80,13 +114,20 @@ def face_cutout(payload: FaceCutoutRequest):
     arr = np.frombuffer(raw, dtype=np.uint8)
     bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if bgr is None:
+        # Not cached: a truncated or interrupted download lands here too, and
+        # that says nothing about the photo itself -- see CACHEABLE_ERRORS.
         raise HTTPException(400, detail={"error": "unreadable_image"})
 
     boxes = app.state.face_counter.detect_boxes(bgr)
     if not boxes:
-        raise HTTPException(422, detail={"error": "no_face"})
+        app.state.cutout_cache.put_error(cache_key, payload.photo_url, "no_face", None)
+        raise _face_verdict_error("no_face", None)
     if len(boxes) > 1:
-        raise HTTPException(422, detail={"error": "multiple_faces", "count": len(boxes)})
+        app.state.cutout_cache.put_error(
+            cache_key, payload.photo_url, "multiple_faces", len(boxes)
+        )
+        raise _face_verdict_error("multiple_faces", len(boxes))
 
     png_bytes = app.state.cutout_maker.make(bgr, boxes[0], settings.output_size)
+    app.state.cutout_cache.put_png(cache_key, payload.photo_url, png_bytes)
     return Response(content=png_bytes, media_type="image/png")

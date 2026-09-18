@@ -24,6 +24,20 @@ class Settings(BaseSettings):
     #: giving up -- this request blocks the caller's whole Facy Bird flow,
     #: so a slow/hanging photo host shouldn't be able to stall it forever.
     fetch_timeout_seconds: float = 10.0
+    #: Postgres connection string for the cutout cache (see cutout_cache.py),
+    #: pointing at the same Neon database leaderboard-api uses. Optional by
+    #: design: left unset, the cache switches off and the service behaves
+    #: exactly as it did when it was stateless -- recomputing every request,
+    #: never failing because of a database.
+    database_url: str | None = None
+    #: Cached cutouts nothing has requested in this long get swept at
+    #: startup. Generous because a hit is only ever a saving -- this is
+    #: about bounding storage growth, not about freshness (a changed photo
+    #: arrives under a new URL, so it never needs to expire to be correct).
+    cache_ttl_days: int = 90
+    #: Bounded so a hanging database costs a couple of seconds of a
+    #: user-facing request rather than the full default TCP timeout.
+    db_connect_timeout_seconds: int = 5
 
     @property
     def cors_origins(self) -> list[str]:
